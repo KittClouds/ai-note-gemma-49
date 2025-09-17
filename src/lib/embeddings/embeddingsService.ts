@@ -6,6 +6,7 @@ import { createNoteChunksSemantic } from './textProcessing';
 import { SemanticChunkingOptions } from './semanticChunkingConfig';
 import { providerRegistry } from './providers/ProviderRegistry';
 import { EmbeddingProvider } from './providers/EmbeddingProvider';
+import { upsertEmbedding, deleteEmbedding, searchByEmbedding, clearEntityDB, EntityDBResult } from '../vector/entitydbStore';
 
 export interface EmbeddingWorkerMessage {
   source: string;
@@ -27,6 +28,8 @@ export interface SearchResult {
   graphScore?: number;
 }
 
+export type SearchBackend = 'graphrag' | 'entitydb';
+
 export interface IndexStatus {
   hasIndex: boolean;
   indexSize: number;
@@ -42,6 +45,7 @@ export class EmbeddingsService {
   private noteMetadata = new Map<string, { title: string; noteId: string }>();
   private currentProvider: EmbeddingProvider | null = null;
   private currentDimension: number | null = null;
+  private searchBackend: SearchBackend = 'graphrag';
 
   constructor() {
     // Don't initialize components here - wait for provider initialization
@@ -122,6 +126,20 @@ export class EmbeddingsService {
     return this.currentProvider;
   }
 
+  setSearchBackend(backend: SearchBackend): void {
+    this.searchBackend = backend;
+    console.log(`[EmbeddingsService] Search backend set to: ${backend}`);
+  }
+
+  getSearchBackend(): SearchBackend {
+    return this.searchBackend;
+  }
+
+  private getVectorPath(): string {
+    const providerId = this.currentProvider?.name.toLowerCase().replace(/\s+/g, '-') || 'unknown';
+    return `notes-entitydb-${providerId}-v1`;
+  }
+
   private async generateEmbeddings(text: string | string[], isQuery = false): Promise<number[][]> {
     if (!this.currentProvider) {
       throw new Error('No embedding provider initialized');
@@ -199,8 +217,9 @@ export class EmbeddingsService {
 
       console.log(`[EmbeddingsService] Processing ${chunks.length} chunks for note ${noteId}`);
 
-      // Add nodes to GraphRAG
-      chunks.forEach((chunk, index) => {
+      // Add nodes to GraphRAG and EntityDB
+      for (let index = 0; index < chunks.length; index++) {
+        const chunk = chunks[index];
         const nodeId = `${noteId}_chunk_${index}`;
         const embedding = embeddings[index];
         
@@ -223,7 +242,26 @@ export class EmbeddingsService {
         
         this.graphRAG!.addNode(node);
         this.noteMetadata.set(nodeId, { title, noteId });
-      });
+
+        // Also store in EntityDB for persistence
+        try {
+          await upsertEmbedding({
+            vectorPath: this.getVectorPath(),
+            dimension: this.currentDimension!,
+            id: nodeId,
+            text: chunk.text,
+            embedding: embedding,
+            metadata: {
+              ...chunk.metadata,
+              originalNoteId: noteId,
+              title: title,
+              chunkingMethod
+            }
+          });
+        } catch (error) {
+          console.warn(`Failed to store chunk ${nodeId} in EntityDB:`, error);
+        }
+      }
 
       const totalNodes = this.graphRAG.getNodes().length;
 
@@ -252,7 +290,7 @@ export class EmbeddingsService {
   /**
    * Remove a note from the knowledge graph
    */
-  removeNote(noteId: string): void {
+  async removeNote(noteId: string): Promise<void> {
     const nodes = this.graphRAG!.getNodes();
     const nodesToRemove = nodes.filter(node =>
       node.metadata?.originalNoteId === noteId
@@ -284,14 +322,84 @@ export class EmbeddingsService {
       });
       this.graphRAG!.buildSequentialEdges({ metadataKey: 'chunkIndex', groupBy: 'originalNoteId' });
 
-      console.log(`Removed note ${noteId} from knowledge graph`);
+      // Also remove from EntityDB
+      try {
+        const deletePromises = nodesToRemove.map(node => 
+          deleteEmbedding({
+            vectorPath: this.getVectorPath(),
+            dimension: this.currentDimension!,
+            id: node.id
+          })
+        );
+        await Promise.all(deletePromises);
+      } catch (error) {
+        console.warn(`Failed to remove note ${noteId} from EntityDB:`, error);
+      }
+
+      console.log(`Removed note ${noteId} from knowledge graph and EntityDB`);
     }
   }
 
   /**
-   * Perform semantic search
+   * Perform semantic search using selected backend
    */
   async search(query: string, topK: number = 10): Promise<SearchResult[]> {
+    if (this.searchBackend === 'entitydb') {
+      return this.searchEntityDB(query, topK);
+    }
+    return this.searchGraphRAG(query, topK);
+  }
+
+  /**
+   * Search using EntityDB backend
+   */
+  async searchEntityDB(query: string, topK: number = 10): Promise<SearchResult[]> {
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
+    if (!this.currentProvider || !this.currentDimension) {
+      throw new Error('Provider not initialized');
+    }
+
+    try {
+      console.log(`[EmbeddingsService] EntityDB search for: "${query}" (top ${topK})`);
+      
+      const processedQuery = preprocessText(query);
+      const queryEmbeddings = await this.generateEmbeddings(processedQuery, true);
+      const queryEmbedding = queryEmbeddings[0];
+
+      if (!queryEmbedding || queryEmbedding.length !== this.currentDimension) {
+        throw new Error(`Query embedding dimension mismatch: expected ${this.currentDimension}, got ${queryEmbedding?.length || 0}`);
+      }
+
+      const results = await searchByEmbedding({
+        vectorPath: this.getVectorPath(),
+        dimension: this.currentDimension,
+        queryEmbedding,
+        topK
+      });
+
+      // Convert to SearchResult format
+      const searchResults = results.map(result => ({
+        noteId: result.metadata?.originalNoteId || result.id,
+        title: result.metadata?.title || 'Untitled',
+        content: result.text || result.metadata?.text || '',
+        score: result.score
+      }));
+
+      console.log(`[EmbeddingsService] EntityDB found ${searchResults.length} results`);
+      return searchResults;
+    } catch (error) {
+      console.error('EntityDB search failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Search using GraphRAG backend
+   */
+  async searchGraphRAG(query: string, topK: number = 10): Promise<SearchResult[]> {
     if (!this.isInitialized) {
       await this.initialize();
     }
@@ -301,7 +409,7 @@ export class EmbeddingsService {
     }
 
     try {
-      console.log(`[EmbeddingsService] Searching for: "${query}" (top ${topK})`);
+      console.log(`[EmbeddingsService] GraphRAG search for: "${query}" (top ${topK})`);
       
       const processedQuery = preprocessText(query);
       const queryEmbeddings = await this.generateEmbeddings(processedQuery, true);
@@ -334,10 +442,10 @@ export class EmbeddingsService {
         };
       });
 
-      console.log(`[EmbeddingsService] Found ${searchResults.length} results`);
+      console.log(`[EmbeddingsService] GraphRAG found ${searchResults.length} results`);
       return searchResults;
     } catch (error) {
-      console.error('Semantic search failed:', error);
+      console.error('GraphRAG search failed:', error);
       throw error;
     }
   }
@@ -394,6 +502,17 @@ export class EmbeddingsService {
     }
     if (this.hnswAdapter) {
       this.hnswAdapter.clear();
+    }
+    // Also clear EntityDB
+    if (this.currentDimension) {
+      try {
+        clearEntityDB({
+          vectorPath: this.getVectorPath(),
+          dimension: this.currentDimension
+        });
+      } catch (error) {
+        console.warn('Failed to clear EntityDB:', error);
+      }
     }
   }
 

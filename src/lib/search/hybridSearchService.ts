@@ -15,6 +15,7 @@ export interface HybridSearchResult {
 export interface HybridSearchOptions {
   limit?: number;
   alpha: number; // 0.0 = sparse only, 1.0 = dense only
+  embeddingBackend?: 'graphrag' | 'entitydb';
 }
 
 class HybridSearchService {
@@ -26,16 +27,21 @@ class HybridSearchService {
   }
 
   async search(query: string, options: HybridSearchOptions): Promise<HybridSearchResult[]> {
-    const { limit = 10, alpha } = options;
+    const { limit = 10, alpha, embeddingBackend } = options;
 
     if (!query.trim()) return [];
     if (alpha < 0 || alpha > 1) {
       throw new Error("Alpha must be between 0.0 and 1.0.");
     }
     
-    console.log(`--- Initiating Hybrid Search (alpha: ${alpha}) for: "${query}" ---`);
+    console.log(`--- Initiating Hybrid Search (alpha: ${alpha}, backend: ${embeddingBackend || 'current'}) for: "${query}" ---`);
 
     const searchLimit = limit * 3;
+
+    // Set backend if specified
+    if (embeddingBackend) {
+      this.embeddings.setSearchBackend(embeddingBackend);
+    }
 
     const [sparseResults, denseResults] = await Promise.all([
       this.bm25.search(query, searchLimit),
