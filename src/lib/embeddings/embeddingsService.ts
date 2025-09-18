@@ -6,7 +6,7 @@ import { createNoteChunksSemantic } from './textProcessing';
 import { SemanticChunkingOptions } from './semanticChunkingConfig';
 import { providerRegistry } from './providers/ProviderRegistry';
 import { EmbeddingProvider } from './providers/EmbeddingProvider';
-import { upsertEmbedding, deleteEmbedding, searchByEmbedding, clearEntityDB, EntityDBResult } from '../vector/entitydbStore';
+import { upsertEmbedding, deleteEmbedding, searchByEmbedding, clearEntityDB, EntityDBResult, getEntityDBCount, getAllEmbeddings } from '../vector/entitydbStore';
 
 export interface EmbeddingWorkerMessage {
   source: string;
@@ -70,6 +70,9 @@ export class EmbeddingsService {
       // Initialize components with provider's dimensions
       await this.initializeComponents(this.currentProvider.dimension);
       
+      // Load existing embeddings from EntityDB
+      await this.loadFromEntityDB();
+      
       this.isInitialized = true;
       console.log('[EmbeddingsService] Initialization complete');
     } catch (error) {
@@ -93,6 +96,56 @@ export class EmbeddingsService {
     this.hnswAdapter = new HNSWAdapter(dimension);
     
     console.log(`[EmbeddingsService] Components initialized with ${dimension}D`);
+  }
+
+  private async loadFromEntityDB(): Promise<void> {
+    if (!this.currentProvider || !this.currentDimension || !this.graphRAG) {
+      return;
+    }
+
+    try {
+      console.log('[EmbeddingsService] Loading existing embeddings from EntityDB...');
+      
+      const storedEmbeddings = await getAllEmbeddings({
+        vectorPath: this.getVectorPath(),
+        dimension: this.currentDimension
+      });
+
+      console.log(`[EmbeddingsService] Found ${storedEmbeddings.length} stored embeddings`);
+
+      // Restore nodes to GraphRAG
+      for (const stored of storedEmbeddings) {
+        if (stored.metadata && stored.text) {
+          const node: GraphNode = {
+            id: stored.id,
+            content: stored.text,
+            embedding: stored.metadata.embedding || [],
+            metadata: stored.metadata
+          };
+          
+          this.graphRAG.addNode(node);
+          this.noteMetadata.set(stored.id, { 
+            title: stored.metadata.title || 'Untitled', 
+            noteId: stored.metadata.originalNoteId || stored.id
+          });
+        }
+      }
+
+      // Rebuild graph edges if we have nodes
+      if (storedEmbeddings.length > 0) {
+        console.log('[EmbeddingsService] Rebuilding graph edges...');
+        this.graphRAG.buildSequentialEdges({ metadataKey: 'chunkIndex', groupBy: 'originalNoteId' });
+        this.graphRAG.buildSemanticEdges({
+          threshold: 0.82,
+          index: this.hnswAdapter,
+          k: Math.min(5, Math.max(1, storedEmbeddings.length - 1))
+        });
+      }
+
+      console.log('[EmbeddingsService] Successfully loaded embeddings from EntityDB');
+    } catch (error) {
+      console.warn('Failed to load from EntityDB:', error);
+    }
   }
 
   async switchProvider(providerId: string, apiKey?: string): Promise<void> {
@@ -472,9 +525,9 @@ export class EmbeddingsService {
     return syncedCount;
   }
 
-  getIndexStatus(): IndexStatus {
+  async getIndexStatus(): Promise<IndexStatus> {
     // Handle case when components aren't initialized yet
-    if (!this.graphRAG || !this.hnswAdapter) {
+    if (!this.graphRAG || !this.hnswAdapter || !this.currentDimension) {
       return {
         hasIndex: false,
         indexSize: 0,
@@ -487,9 +540,23 @@ export class EmbeddingsService {
     const nodes = this.graphRAG.getNodes();
     const edges = this.graphRAG.getEdges();
     
+    // Get count from EntityDB for persistent storage
+    let entityDBCount = 0;
+    try {
+      entityDBCount = await getEntityDBCount({
+        vectorPath: this.getVectorPath(),
+        dimension: this.currentDimension
+      });
+    } catch (error) {
+      console.warn('Failed to get EntityDB count:', error);
+    }
+    
+    // Use EntityDB count as the authoritative source for index size
+    const indexSize = Math.max(nodes.length, entityDBCount);
+    
     return {
-      hasIndex: nodes.length > 0,
-      indexSize: nodes.length,
+      hasIndex: indexSize > 0,
+      indexSize: indexSize,
       needsRebuild: false,
       graphNodes: nodes.length,
       graphEdges: edges.length

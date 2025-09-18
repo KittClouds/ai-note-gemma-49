@@ -101,3 +101,41 @@ export async function clearEntityDB(params: {
   });
   await db.clear();
 }
+
+export async function getEntityDBCount(params: {
+  vectorPath: string;
+  dimension: number;
+}): Promise<number> {
+  const { db } = await getEntityDB({
+    vectorPath: params.vectorPath,
+    dimension: params.dimension,
+  });
+  
+  try {
+    // Query all items and count them since EntityDB doesn't have a direct count method
+    const results = await db.queryManualVectors([0]); // Use dummy vector to get all items
+    return results ? results.length : 0;
+  } catch (error) {
+    console.warn('Failed to get EntityDB count:', error);
+    return 0;
+  }
+}
+
+export async function getAllEmbeddings(params: {
+  vectorPath: string;
+  dimension: number;
+}): Promise<EntityDBResult[]> {
+  const { db } = await getEntityDB({
+    vectorPath: params.vectorPath,
+    dimension: params.dimension,
+  });
+  
+  try {
+    // Get all stored embeddings - we'll use a zero vector as dummy query and take all results
+    const results = await db.queryManualVectors(new Array(params.dimension).fill(0));
+    return results as EntityDBResult[];
+  } catch (error) {
+    console.warn('Failed to get all embeddings from EntityDB:', error);
+    return [];
+  }
+}

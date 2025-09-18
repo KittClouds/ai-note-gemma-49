@@ -59,10 +59,13 @@ export const EnhancedSearchBar: React.FC<EnhancedSearchBarProps> = ({
   const { toast } = useToast();
 
   useEffect(() => {
-    const status = embeddingsService.getIndexStatus();
-    setIndexStatus(status);
-    const bm25Status = bm25Service.getIndexStatus();
-    setBm25IndexStatus(bm25Status);
+    const loadIndexStatus = async () => {
+      const status = await embeddingsService.getIndexStatus();
+      setIndexStatus(status);
+      const bm25Status = bm25Service.getIndexStatus();
+      setBm25IndexStatus(bm25Status);
+    };
+    loadIndexStatus();
   }, []);
 
   const handleSemanticSearch = useDebouncedCallback(async (query: string) => {
@@ -211,7 +214,7 @@ export const EnhancedSearchBar: React.FC<EnhancedSearchBarProps> = ({
     setIsSyncing(true);
     try {
       const count = await embeddingsService.syncAllNotes(notes);
-      const newStatus = embeddingsService.getIndexStatus();
+      const newStatus = await embeddingsService.getIndexStatus();
       setIndexStatus(newStatus);
       toast({
         title: "Embeddings synced",
@@ -255,7 +258,7 @@ export const EnhancedSearchBar: React.FC<EnhancedSearchBarProps> = ({
     setIsSyncing(true);
     try {
       await hybridSearchService.syncAllNotes(notes);
-      const newStatus = embeddingsService.getIndexStatus();
+      const newStatus = await embeddingsService.getIndexStatus();
       const newBM25Status = bm25Service.getIndexStatus();
       setIndexStatus(newStatus);
       setBm25IndexStatus(newBM25Status);
