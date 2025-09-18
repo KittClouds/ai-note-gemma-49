@@ -75,8 +75,20 @@ export const EnhancedSearchBar: React.FC<EnhancedSearchBarProps> = ({
     }
     setIsSearching(true);
     try {
-      const results = await embeddingsService.search(query, 10);
-      setSemanticResults(results);
+      const results = await embeddingsService.search(query, 50); // Get more results for deduplication
+      
+      // Group by noteId, keep highest scoring chunk per note
+      const deduped = Object.values(
+        results
+          .sort((a, b) => b.score - a.score)
+          .reduce((acc, r) => {
+            const k = r.noteId;
+            if (!acc[k] || r.score > acc[k].score) acc[k] = r;
+            return acc;
+          }, {} as Record<string, SearchResult>)
+      );
+      
+      setSemanticResults(deduped.slice(0, 10));
     } catch (error) {
       console.error('Semantic search failed:', error);
       toast({
